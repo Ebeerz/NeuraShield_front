@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '');
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? 'http://150.241.90.104:8000').replace(/\/$/, '');
 const PROTECT_ENDPOINT = `${API_BASE_URL}/api/v1/protect`;
 const acceptedTypes = ['image/png', 'image/jpeg', 'image/webp'];
 const protectionModes = ['low', 'mid', 'high'];
