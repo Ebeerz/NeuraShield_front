@@ -1,5 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '');
+const PROTECT_ENDPOINT = `${API_BASE_URL}/api/v1/protect`;
+const acceptedTypes = ['image/png', 'image/jpeg', 'image/webp'];
+const protectionModes = ['low', 'mid', 'high'];
+const logoUrl = `${import.meta.env.BASE_URL}logo.png`;
+const initialResultMeta = {
+  detectedFaces: '',
+  protectionMode: '',
+  contentType: '',
+};
+
 const formatFileSize = (bytes) => {
   if (!bytes) {
     return '0 B';
@@ -11,43 +22,225 @@ const formatFileSize = (bytes) => {
   return `${value.toFixed(power === 0 ? 0 : 1)} ${units[power]}`;
 };
 
-const acceptedTypes = ['image/png', 'image/jpeg', 'image/webp'];
+const getReadableFormat = (mimeType) => {
+  if (!mimeType) {
+    return 'Неизвестно';
+  }
+
+  const normalizedMimeType = mimeType.toLowerCase();
+
+  if (normalizedMimeType.includes('png')) {
+    return 'PNG';
+  }
+
+  if (normalizedMimeType.includes('jpeg') || normalizedMimeType.includes('jpg')) {
+    return 'JPG';
+  }
+
+  if (normalizedMimeType.includes('webp')) {
+    return 'WEBP';
+  }
+
+  return mimeType.replace('image/', '').toUpperCase() || 'Неизвестно';
+};
+
+const getOutputFormat = (mimeType) => {
+  if (mimeType === 'image/jpeg') {
+    return 'jpg';
+  }
+
+  if (mimeType === 'image/webp') {
+    return 'webp';
+  }
+
+  return 'png';
+};
+
+const buildFallbackFilename = (fileName, outputFormat) => {
+  const safeOutputFormat = outputFormat || 'png';
+  const baseName = fileName?.replace(/\.[^./\\]+$/, '') || 'protected';
+  return `${baseName}-protected.${safeOutputFormat}`;
+};
+
+const parseContentDispositionFilename = (headerValue) => {
+  if (!headerValue) {
+    return '';
+  }
+
+  const utf8Match = headerValue.match(/filename\*=UTF-8''([^;]+)/i);
+
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1].trim().replace(/^"(.*)"$/, '$1'));
+    } catch {
+      return utf8Match[1].trim().replace(/^"(.*)"$/, '$1');
+    }
+  }
+
+  const fileNameMatch = headerValue.match(/filename=(?:"([^"]+)"|([^;]+))/i);
+  return fileNameMatch?.[1] || fileNameMatch?.[2]?.trim() || '';
+};
+
+const getErrorMessage = async (response) => {
+  const contentType = response.headers.get('content-type') || '';
+  let detail = '';
+
+  if (contentType.includes('application/json')) {
+    try {
+      const payload = await response.json();
+      detail = payload?.detail || '';
+    } catch {
+      detail = '';
+    }
+  } else {
+    try {
+      detail = (await response.text()).trim();
+    } catch {
+      detail = '';
+    }
+  }
+
+  if (response.status === 422 && detail.toLowerCase().includes('no face')) {
+    return 'Лицо на изображении не найдено. Попробуйте выбрать фото, где лицо видно целиком.';
+  }
+
+  if (response.status === 400) {
+    return detail || 'Сервер не смог принять файл. Проверьте, что это корректное изображение.';
+  }
+
+  if (response.status >= 500) {
+    return 'На сервере произошла ошибка при обработке изображения. Попробуйте ещё раз чуть позже.';
+  }
+
+  return detail || `Не удалось обработать изображение. Код ответа: ${response.status}.`;
+};
 
 export default function App() {
+  const abortControllerRef = useRef(null);
   const inputRef = useRef(null);
   const [isDragActive, setIsDragActive] = useState(false);
   const [file, setFile] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState('');
+  const [mode, setMode] = useState('low');
+  const [sourcePreviewUrl, setSourcePreviewUrl] = useState('');
+  const [resultBlob, setResultBlob] = useState(null);
+  const [resultPreviewUrl, setResultPreviewUrl] = useState('');
+  const [resultFileName, setResultFileName] = useState('');
+  const [resultMeta, setResultMeta] = useState(initialResultMeta);
+  const [uiState, setUiState] = useState('idle');
+  const [errorMessage, setErrorMessage] = useState('');
+
+  useEffect(() => () => abortControllerRef.current?.abort(), []);
 
   useEffect(() => {
     if (!file) {
-      setPreviewUrl('');
+      setSourcePreviewUrl('');
       return undefined;
     }
 
-    const url = URL.createObjectURL(file);
-    setPreviewUrl(url);
+    const objectUrl = URL.createObjectURL(file);
+    setSourcePreviewUrl(objectUrl);
 
     return () => {
-      URL.revokeObjectURL(url);
+      URL.revokeObjectURL(objectUrl);
     };
   }, [file]);
 
+  useEffect(() => {
+    if (!resultBlob) {
+      setResultPreviewUrl('');
+      return undefined;
+    }
+
+    const objectUrl = URL.createObjectURL(resultBlob);
+    setResultPreviewUrl(objectUrl);
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [resultBlob]);
+
+  const resetResultState = () => {
+    setResultBlob(null);
+    setResultFileName('');
+    setResultMeta(initialResultMeta);
+  };
+
+  const statusContent = useMemo(() => {
+    if (uiState === 'processing') {
+      return {
+        title: 'Обработка запущена',
+        description: 'Изображение отправлено на сервер. Как только ответ придёт, превью обновится автоматически.',
+      };
+    }
+
+    if (uiState === 'success') {
+      return {
+        title: 'Готово',
+        description: 'Показан результат от backend API. Его можно сразу скачать на устройство.',
+      };
+    }
+
+    if (uiState === 'error') {
+      return {
+        title: 'Есть проблема',
+        description: errorMessage,
+      };
+    }
+
+    if (file) {
+      return {
+        title: 'Файл готов к отправке',
+        description: 'Выберите режим защиты и нажмите кнопку запуска обработки.',
+      };
+    }
+
+    return {
+      title: 'Загрузите изображение',
+      description: 'Поддерживаются форматы PNG, JPG и WEBP. После выбора файла можно сразу запустить обработку.',
+    };
+  }, [errorMessage, file, uiState]);
+
+  const activePreviewUrl = resultPreviewUrl || sourcePreviewUrl;
+  const previewTitle = resultPreviewUrl ? 'Обработанное изображение' : file ? 'Исходное изображение' : 'Изображение пока не выбрано';
+  const previewAlt = resultPreviewUrl
+    ? 'Превью обработанного изображения'
+    : 'Превью загруженного изображения';
+
   const fileMeta = useMemo(() => {
+    if (uiState === 'success' && resultBlob) {
+      return [
+        { label: 'Результат', value: resultFileName || 'Файл готов' },
+        { label: 'Найдено лиц', value: resultMeta.detectedFaces || 'Не указано' },
+        { label: 'Режим защиты', value: resultMeta.protectionMode || mode },
+        { label: 'Формат', value: getReadableFormat(resultMeta.contentType || resultBlob.type) },
+      ];
+    }
+
     if (!file) {
       return [
         { label: 'Статус', value: 'Ожидает загрузки' },
-        { label: 'Режим', value: 'Подготовка изображения' },
-        { label: 'Готово к скачиванию', value: 'Нет' },
+        { label: 'Режим защиты', value: mode },
+        { label: 'Превью результата', value: 'Пока нет' },
+        { label: 'Скачивание', value: 'Недоступно' },
       ];
     }
 
     return [
       { label: 'Имя файла', value: file.name },
-      { label: 'Формат', value: file.type.replace('image/', '').toUpperCase() || 'Неизвестно' },
+      { label: 'Формат', value: getReadableFormat(file.type) },
       { label: 'Размер', value: formatFileSize(file.size) },
+      { label: 'Режим защиты', value: mode },
     ];
-  }, [file]);
+  }, [file, mode, resultBlob, resultFileName, resultMeta.contentType, resultMeta.detectedFaces, resultMeta.protectionMode, uiState]);
+
+  const statusClassName = [
+    'status-panel',
+    uiState === 'processing' ? 'is-processing' : '',
+    uiState === 'success' ? 'is-success' : '',
+    uiState === 'error' ? 'is-error' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   const handleIncomingFile = (incomingFile) => {
     if (!incomingFile) {
@@ -55,15 +248,28 @@ export default function App() {
     }
 
     if (!incomingFile.type.startsWith('image/')) {
+      setUiState('error');
+      setErrorMessage('Можно загрузить только изображение в формате PNG, JPG или WEBP.');
       return;
     }
 
+    if (!acceptedTypes.includes(incomingFile.type)) {
+      setUiState('error');
+      setErrorMessage('Формат не поддерживается. Используйте PNG, JPG или WEBP.');
+      return;
+    }
+
+    abortControllerRef.current?.abort();
     setFile(incomingFile);
+    resetResultState();
+    setUiState('idle');
+    setErrorMessage('');
   };
 
   const handleInputChange = (event) => {
     const incomingFile = event.target.files?.[0];
     handleIncomingFile(incomingFile);
+    event.target.value = '';
   };
 
   const handleDragOver = (event) => {
@@ -83,17 +289,107 @@ export default function App() {
     handleIncomingFile(incomingFile);
   };
 
-  const handleDownload = () => {
-    if (!file) {
+  const handleClear = () => {
+    abortControllerRef.current?.abort();
+    setFile(null);
+    setIsDragActive(false);
+    resetResultState();
+    setUiState('idle');
+    setErrorMessage('');
+
+    if (inputRef.current) {
+      inputRef.current.value = '';
+    }
+  };
+
+  const handleProcess = async () => {
+    if (!file || uiState === 'processing') {
       return;
     }
 
-    const downloadUrl = URL.createObjectURL(file);
+    const outputFormat = getOutputFormat(file.type);
+    const controller = new AbortController();
+
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = controller;
+    resetResultState();
+    setUiState('processing');
+    setErrorMessage('');
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('mode', mode);
+    formData.append('output_format', outputFormat);
+
+    try {
+      const response = await fetch(PROTECT_ENDPOINT, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        setUiState('error');
+        setErrorMessage(await getErrorMessage(response));
+        return;
+      }
+
+      const blob = await response.blob();
+      const contentType = response.headers.get('content-type') || blob.type;
+
+      if (contentType && !contentType.startsWith('image/')) {
+        throw new Error('unexpected-response');
+      }
+
+      const resolvedFormat = getOutputFormat(contentType || file.type);
+      const contentDisposition = response.headers.get('content-disposition');
+      const detectedFaces = response.headers.get('x-detected-faces') || '';
+      const protectionMode = response.headers.get('x-protection-mode') || mode;
+
+      setResultBlob(blob);
+      setResultFileName(
+        parseContentDispositionFilename(contentDisposition) || buildFallbackFilename(file.name, resolvedFormat),
+      );
+      setResultMeta({
+        detectedFaces,
+        protectionMode,
+        contentType,
+      });
+      setUiState('success');
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        return;
+      }
+
+      setUiState('error');
+      setErrorMessage(
+        error.message === 'unexpected-response'
+          ? 'Сервер вернул неожиданный ответ вместо изображения.'
+          : `Сервер недоступен. Проверьте, что backend запущен по адресу ${API_BASE_URL}.`,
+      );
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+    }
+  };
+
+  const handleDownload = () => {
+    if (!resultBlob) {
+      return;
+    }
+
+    const downloadUrl = URL.createObjectURL(resultBlob);
     const anchor = document.createElement('a');
     anchor.href = downloadUrl;
-    anchor.download = file.name;
+    anchor.download = resultFileName || buildFallbackFilename(file?.name, getOutputFormat(resultBlob.type));
+    document.body.appendChild(anchor);
     anchor.click();
-    URL.revokeObjectURL(downloadUrl);
+    anchor.remove();
+
+    window.setTimeout(() => {
+      URL.revokeObjectURL(downloadUrl);
+    }, 0);
   };
 
   const openFilePicker = () => {
@@ -107,7 +403,7 @@ export default function App() {
 
       <header className="topbar">
         <a className="brand" href="#hero">
-          <img className="brand-logo" src="/logo.png" alt="Логотип NeuraShield" />
+          <img className="brand-logo" src={logoUrl} alt="Логотип NeuraShield" />
           <span>NeuraShield</span>
         </a>
 
@@ -124,8 +420,8 @@ export default function App() {
             <p className="eyebrow">NeuraShield</p>
             <h1>Защитите изображение перед публикацией</h1>
             <p className="hero-text">
-              Загрузите изображение, проверьте результат в рабочей области и
-              скачайте готовый файл в аккуратном и понятном интерфейсе.
+              Загрузите изображение, отправьте его на обработку в backend API и
+              скачайте уже защищённую версию в том же рабочем окне.
             </p>
 
             <div className="hero-actions">
@@ -139,8 +435,8 @@ export default function App() {
 
             <div className="hero-badges">
               <span>Защита изображений</span>
-              <span>Быстрая загрузка</span>
-              <span>Мгновенное превью</span>
+              <span>Реальная обработка на сервере</span>
+              <span>Готовый файл для скачивания</span>
             </div>
           </div>
 
@@ -149,16 +445,16 @@ export default function App() {
               <p className="card-label">Сервис</p>
               <h2>Приватная работа с изображениями в одном понятном потоке</h2>
               <p>
-                NeuraShield объединяет загрузку, просмотр и экспорт изображения
-                в одном окне, чтобы пользователь мог быстро подготовить файл к публикации.
+                NeuraShield объединяет загрузку, серверную обработку, просмотр
+                результата и экспорт готового файла в одном окне.
               </p>
             </div>
 
             <div className="hero-card hero-card-accent">
               <span className="mini-pill">Преимущество</span>
               <p>
-                Интерфейс сфокусирован на простом сценарии: загрузить файл,
-                увидеть его сразу и без лишних действий получить результат.
+                Пользователь проходит короткий сценарий: выбрать файл, запустить
+                защиту, увидеть результат и скачать его без лишних экранов.
               </p>
             </div>
           </div>
@@ -167,10 +463,10 @@ export default function App() {
         <section className="workspace" id="workspace">
           <div className="workspace-copy">
             <p className="eyebrow">Рабочая область</p>
-            <h2>Загрузите файл и сразу получите готовое превью.</h2>
+            <h2>Загрузите файл и дождитесь готового результата от сервера.</h2>
             <p>
-              Вся работа с изображением собрана в одном месте: загрузка, просмотр
-              и скачивание без перегруженного интерфейса.
+              Вся работа с изображением собрана в одном месте: загрузка, запуск
+              обработки, обновлённое превью и скачивание итогового файла.
             </p>
           </div>
 
@@ -180,6 +476,7 @@ export default function App() {
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
               onDrop={handleDrop}
+              aria-busy={uiState === 'processing'}
             >
               <input
                 ref={inputRef}
@@ -192,49 +489,101 @@ export default function App() {
               <div className="dropzone-badge">Зона загрузки</div>
               <h3>Загрузите PNG, JPG или WEBP</h3>
               <p>
-                Перетащите изображение в эту область или выберите файл вручную.
+                Перетащите изображение в эту область или выберите файл вручную,
+                затем отправьте его на обработку.
               </p>
 
+              <div className="control-stack">
+                <label className="field-label" htmlFor="protection-mode">
+                  Режим защиты
+                </label>
+                <select
+                  id="protection-mode"
+                  className="mode-select"
+                  value={mode}
+                  onChange={(event) => setMode(event.target.value)}
+                  disabled={uiState === 'processing'}
+                >
+                  {protectionModes.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+                <p className="helper-text">
+                  `low` даёт более мягкую обработку, `high` усиливает защиту изображения.
+                </p>
+              </div>
+
               <div className="upload-panel-actions">
-                <button className="primary-button" type="button" onClick={openFilePicker}>
+                <button className="ghost-button" type="button" onClick={openFilePicker}>
                   Выбрать файл
                 </button>
                 <button
                   className="ghost-button"
                   type="button"
-                  onClick={() => setFile(null)}
-                  disabled={!file}
+                  onClick={handleClear}
+                  disabled={!file && !resultBlob}
                 >
                   Очистить
                 </button>
+                <button
+                  className="primary-button primary-button-wide"
+                  type="button"
+                  onClick={handleProcess}
+                  disabled={!file || uiState === 'processing'}
+                >
+                  {uiState === 'processing' ? 'Обрабатываем...' : 'Запустить обработку'}
+                </button>
+              </div>
+
+              {file ? (
+                <div className="selected-file">
+                  <strong>{file.name}</strong>
+                  <span>
+                    {getReadableFormat(file.type)} • {formatFileSize(file.size)}
+                  </span>
+                </div>
+              ) : null}
+
+              <div className={statusClassName}>
+                <strong>{statusContent.title}</strong>
+                <p>{statusContent.description}</p>
               </div>
             </div>
 
-            <div className="preview-panel" id="preview">
+            <div className="preview-panel" id="preview" aria-busy={uiState === 'processing'}>
               <div className="panel-head">
                 <div>
                   <p className="eyebrow eyebrow-small">Превью</p>
-                  <h3>{file ? 'Загруженное изображение' : 'Изображение пока не выбрано'}</h3>
+                  <h3>{previewTitle}</h3>
                 </div>
                 <button
                   className="download-button"
                   type="button"
                   onClick={handleDownload}
-                  disabled={!file}
+                  disabled={!resultBlob}
                 >
-                  Скачать файл
+                  Скачать результат
                 </button>
               </div>
 
-              <div className="preview-stage">
-                {previewUrl ? (
-                  <img src={previewUrl} alt="Превью загруженного изображения" />
+              <div className={`preview-stage ${uiState === 'processing' ? 'is-processing' : ''}`}>
+                {activePreviewUrl ? (
+                  <img src={activePreviewUrl} alt={previewAlt} />
                 ) : (
                   <div className="preview-placeholder">
                     <span />
-                    <p>Здесь появится превью загруженного изображения</p>
+                    <p>Здесь появится превью изображения и затем обработанный результат</p>
                   </div>
                 )}
+
+                {uiState === 'processing' ? (
+                  <div className="preview-overlay">
+                    <div className="loader" aria-hidden="true" />
+                    <p>Изображение обрабатывается на сервере...</p>
+                  </div>
+                ) : null}
               </div>
 
               <div className="meta-grid">
@@ -252,10 +601,10 @@ export default function App() {
         <section className="features" id="features">
           <article className="feature-card">
             <p className="feature-number">01</p>
-            <h3>Быстрая загрузка</h3>
+            <h3>Быстрая отправка</h3>
             <p>
-              Изображение сразу попадает в рабочую область и становится доступным
-              для просмотра без лишних промежуточных экранов.
+              Изображение уходит на backend API через `FormData`, без
+              дополнительной авторизации и лишних промежуточных шагов.
             </p>
           </article>
 
@@ -263,8 +612,8 @@ export default function App() {
             <p className="feature-number">02</p>
             <h3>Чистое превью</h3>
             <p>
-              Пользователь сразу видит изображение в отдельной панели и может
-              быстро проверить результат перед скачиванием.
+              После ответа сервера интерфейс автоматически показывает уже
+              обработанную версию изображения в основной панели превью.
             </p>
           </article>
 
@@ -272,8 +621,8 @@ export default function App() {
             <p className="feature-number">03</p>
             <h3>Простой экспорт</h3>
             <p>
-              После загрузки файл можно получить обратно одним действием, без
-              сложных настроек и лишних шагов.
+              Пользователь скачивает именно результат обработки, включая имя файла
+              из `Content-Disposition`, если сервер его передал.
             </p>
           </article>
         </section>
